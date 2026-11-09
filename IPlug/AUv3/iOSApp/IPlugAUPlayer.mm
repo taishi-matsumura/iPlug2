@@ -87,7 +87,17 @@
   
 #if PLUG_TYPE != 1
   if (pluginInputFormat != nil)
-    [audioEngine connect:audioEngine.inputNode to:avAudioUnit format: micInputFormat];
+  {
+    // The iOS Simulator can report an invalid input node hardware format
+    // (sample rate 0), which makes -[AVAudioEngine connect:to:format:] throw
+    // ("IsFormatSampleRateAndChannelCountValid(format)" / "Input HW format is
+    // invalid"). Skip the mic connection in that case; the plugin's input bus
+    // is then fed silence. Real devices always report a valid format here.
+    if (micInputFormat != nil && micInputFormat.sampleRate > 0.0 && micInputFormat.channelCount > 0)
+      [audioEngine connect:audioEngine.inputNode to:avAudioUnit format: micInputFormat];
+    else
+      NSLog(@"Input HW format invalid - running without audio input");
+  }
 #endif
   
   auto numOutputBuses = [avAudioUnit numberOfOutputs];
