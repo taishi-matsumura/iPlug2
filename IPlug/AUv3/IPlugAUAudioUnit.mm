@@ -14,6 +14,7 @@
 
 #import "IPlugAUAudioUnit.h"
 #include "IPlugAUv3.h"
+#include "IGraphics.h"
 #include "AUv2/IPlugAU_ioconfig.h"
 
 #if !__has_feature(objc_arc)
@@ -847,7 +848,31 @@ static AUAudioUnitPreset* NewAUPreset(NSInteger number, NSString* pName)
 - (void) hostResized:(CGSize) newSize
 {
   if (mPlug->GetHostResizeEnabled())
+  {
     mPlug->OnParentWindowResize(newSize.width, newSize.height);
+    return;
+  }
+
+#ifdef OS_IOS
+  // PLUG_HOST_RESIZE 0 plugs keep their fixed design size and iPlug2's iOS path
+  // never scales it: the view sat as a small top-left island in the window with
+  // black filling the rest. Scale the IGraphics draw instead (the same
+  // EUIResizerMode::Scale behaviour the desktop corner resizer uses), keeping the
+  // logical layout at PLUG_WIDTH x PLUG_HEIGHT. IGraphicsIOS::PlatformResize()
+  // resizes and centers the platform view to match.
+  if (igraphics::IGraphics* pGraphics = mPlug->GetUI())
+  {
+    const float w = static_cast<float>(newSize.width);
+    const float h = static_cast<float>(newSize.height);
+    if (w > 0.f && h > 0.f)
+    {
+      const float scaleX = w / static_cast<float>(pGraphics->Width());
+      const float scaleY = h / static_cast<float>(pGraphics->Height());
+      const float fit = scaleX < scaleY ? scaleX : scaleY;
+      pGraphics->Resize(pGraphics->Width(), pGraphics->Height(), fit);
+    }
+  }
+#endif
 }
 
 - (bool) sendMidiData:(int64_t) sampleTime : (NSInteger) length : (const uint8_t*) midiBytes

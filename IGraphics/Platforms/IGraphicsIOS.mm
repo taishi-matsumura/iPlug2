@@ -141,8 +141,17 @@ void IGraphicsIOS::PlatformResize(bool parentHasResized)
 {
   if (mView)
   {
-    CGRect r = CGRectMake(0., 0., static_cast<CGFloat>(WindowWidth()), static_cast<CGFloat>(WindowHeight()));
-    [(IGRAPHICS_VIEW*) mView setFrame: r ];
+    IGRAPHICS_VIEW* pView = (IGRAPHICS_VIEW*) mView;
+    CGSize size = CGSizeMake(static_cast<CGFloat>(WindowWidth()), static_cast<CGFloat>(WindowHeight()));
+    CGPoint origin = CGPointZero;
+    if (UIView* parentView = pView.superview)
+    {
+      // Letterbox inside the container when the scaled design size does not match
+      // its aspect ratio, instead of pinning the UI to the top-left corner.
+      origin.x = floorf((parentView.bounds.size.width - size.width) / 2.f);
+      origin.y = floorf((parentView.bounds.size.height - size.height) / 2.f);
+    }
+    [pView setFrame: CGRectMake(origin.x, origin.y, size.width, size.height)];
   }
 }
 
