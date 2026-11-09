@@ -531,6 +531,27 @@ static AUAudioUnitPreset* NewAUPreset(NSInteger number, NSString* pName)
   return YES;
 }
 
+// TEMP DIAGNOSTICS (VoLum, iOS silence hunt): read-only snapshot of what this
+// AU negotiated, exposed for the app-side player to log. The AUv3 extension is
+// a separate link unit and cannot call the app's file logger. Remove together
+// with the rest of the v2 diagnostics.
+- (void) diagRenderStateToArray: (NSMutableArray*) out
+{
+  if (out == nil) return;
+  double busSR = 0.0;
+  long plugSR = 0;
+  unsigned long nOutBuses = 0;
+  if (mBufferedOutputBuses.GetSize() > 0)
+  {
+    nOutBuses = (unsigned long) mBufferedOutputBuses.GetSize();
+    busSR = mBufferedOutputBuses.Get(0)->bus.format.sampleRate;
+  }
+  if (mPlug != nullptr) plugSR = (long) mPlug->GetSampleRate();
+  [out addObject: @(busSR)];
+  [out addObject: @(nOutBuses)];
+  [out addObject: @(plugSR)];
+}
+
 - (void) deallocateRenderResources
 {
   for (auto bufIdx = 0; bufIdx < mBufferedInputBuses.GetSize(); bufIdx++)

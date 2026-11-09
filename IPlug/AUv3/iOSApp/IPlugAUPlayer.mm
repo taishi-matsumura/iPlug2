@@ -9,6 +9,7 @@
 */
 
 #import "IPlugAUPlayer.h"
+#import <objc/message.h> // TEMP DIAGNOSTICS v2 (diagRenderStateToArray:)
 #import <CoreAudio/AudioHardwareBase.h>
 #include "IPlugConstants.h"
 
@@ -90,6 +91,195 @@ static void VoLumDiagLog(NSString* fmt, ...)
 }
 #define NSLog(...) VoLumDiagLog(__VA_ARGS__)
 
+// ===================== TEMP DIAGNOSTICS v2 - begin (delete wholesale) ========
+// Peak dBFS taps only prove "nonzero samples exist"; they cannot show whether
+// audible CONTENT travels a path. So each tap also streams its buffer to a
+// 16-bit PCM WAV inside the container (pullable with devicectl). Realtime
+// blocks only touch a memory ring; a background GCD timer does the file I/O.
+#include <cstdio>
+#include <cstring>
+#include <vector>
+#include <atomic>
+
+namespace volum_diag {
+enum
+{
+  kRingFrames = 1 << 16, // 65536 frames ~ 1.5 s per sink
+  kMaxSinks = 3,
+};
+
+struct Sink
+{
+  FILE* f = nullptr;
+  char tag[12] = {0};
+  int ch = 0;
+  int sr = 0;
+  int wpos = 0;      // frames: ring write cursor
+  int rpos = 0;      // frames: ring flush cursor
+  long long frames = 0;
+  long long dropped = 0;
+  long long flushes = 0;
+  std::vector<int16_t> ring;
+};
+
+static Sink sinks[kMaxSinks];
+static char dirPath[512] = {0};
+static int16_t dryRing[2][kRingFrames];
+static std::atomic<int> dryW {0}, dryR {0};
+
+inline void Init(const char* dir)
+{
+  if (dir)
+    snprintf(dirPath, sizeof(dirPath), "%s", dir);
+}
+
+inline void WavHeader(FILE* f, int sr, int ch)
+{
+  struct
+  {
+    char riff[4]; UInt32 chunk; char wave[4]; char fmt[4]; UInt32 fmtLen;
+    UInt16 tag, channels; UInt32 sr; UInt32 byteRate; UInt16 align, bits;
+    char data[4]; UInt32 dataLen;
+  } h = {{'R','I','F','F'}, 0xFFFFFFFF, {'W','A','V','E'}, {'f','m','t',' '}, 16, 1, 0, 0, 0, 0, 16, {'d','a','t','a'}, 0xFFFFFFFF};
+  h.channels = (UInt16) ch; h.sr = (UInt32) sr; h.byteRate = (UInt32)(sr * ch * 2); h.align = (UInt16)(ch * 2);
+  fwrite(&h, sizeof(h), 1, f);
+}
+
+inline Sink* SinkFor(const char* tag, int ch, double sr)
+{
+  Sink* freeSlot = nullptr;
+  for (int i = 0; i < kMaxSinks; ++i)
+  {
+    if (!sinks[i].tag[0]) { freeSlot = &sinks[i]; continue; }
+    if (strncmp(sinks[i].tag, tag, sizeof(sinks[i].tag)) == 0) return &sinks[i];
+  }
+  if (!freeSlot) return nullptr;
+  snprintf(freeSlot->tag, sizeof(freeSlot->tag), "%s", tag);
+  freeSlot->ch = ch > 2 ? 2 : (ch < 1 ? 1 : ch);
+  freeSlot->sr = (int) sr;
+  freeSlot->ring.assign((size_t) freeSlot->ch * kRingFrames, 0);
+  if (dirPath[0])
+  {
+    char path[640];
+    snprintf(path, sizeof(path), "%s/tap_%s.wav", dirPath, tag);
+    freeSlot->f = fopen(path, "wb");
+    if (freeSlot->f)
+      WavHeader(freeSlot->f, freeSlot->sr, freeSlot->ch);
+  }
+  return freeSlot;
+}
+
+// Called from the audio thread: memory only.
+inline void Sample(const char* tag, const float* const* data, int ch, int frames, double sr)
+{
+  if (!data || frames <= 0 || ch <= 0) return;
+  Sink* s = SinkFor(tag, ch, sr);
+  if (!s || s->ring.empty()) return;
+  const int chs = s->ch;
+  const int avail = (s->wpos - s->rpos + kRingFrames) % kRingFrames;
+  if (avail + frames >= kRingFrames)
+  {
+    s->dropped += frames; // ring overrun: the flusher fell behind
+    return;
+  }
+  int16_t* r = s->ring.data();
+  int w = s->wpos;
+  for (int i = 0; i < frames; ++i)
+  {
+    for (int c = 0; c < chs; ++c)
+    {
+      float v = (c < ch && data[c]) ? data[c][i] : 0.f;
+      if (v > 1.f) v = 1.f; else if (v < -1.f) v = -1.f;
+      r[(size_t) w * chs + c] = (int16_t) (v * 32767.f);
+    }
+    if (++w == kRingFrames) w = 0;
+  }
+  s->wpos = w;
+  s->frames += frames;
+}
+
+// Background flush: file I/O happens here, never on the audio thread.
+inline void Flush()
+{
+  for (int i = 0; i < kMaxSinks; ++i)
+  {
+    Sink* s = &sinks[i];
+    if (!s->f || s->ring.empty()) continue;
+    int n = (s->wpos - s->rpos + kRingFrames) % kRingFrames;
+    if (n <= 0) continue;
+    const int chs = s->ch;
+    int from = s->rpos;
+    if (from + n <= kRingFrames)
+      fwrite(&s->ring[(size_t) from * chs], sizeof(int16_t), (size_t) n * chs, s->f);
+    else
+    {
+      int head = kRingFrames - from;
+      fwrite(&s->ring[(size_t) from * chs], sizeof(int16_t), (size_t) head * chs, s->f);
+      fwrite(&s->ring[0], sizeof(int16_t), (size_t) (n - head) * chs, s->f);
+    }
+    fflush(s->f);
+    s->rpos = s->wpos;
+    s->flushes++;
+  }
+}
+
+inline void Status(char* out, int cap, long long nowSec)
+{
+  static long long lastSec = -1;
+  if (nowSec == lastSec) return;
+  lastSec = nowSec;
+  for (int i = 0; i < kMaxSinks; ++i)
+  {
+    Sink* s = &sinks[i];
+    if (!s->tag[0]) continue;
+    snprintf(out, cap, "tap '%s' frames %lld dropped %lld flushes %lld file %s sr %d ch %d", s->tag, s->frames, s->dropped,
+             s->flushes, s->f ? "open" : "MISSING", s->sr, s->ch);
+    return; // one sink per tick keeps the log readable
+  }
+  out[0] = 0;
+}
+
+// Faint dry DI passthrough: input tap snapshot -> source node playback.
+inline void FeedDry(const float* const* data, int ch, int frames)
+{
+  if (!data || frames <= 0) return;
+  int w = dryW.load(std::memory_order_relaxed);
+  for (int i = 0; i < frames; ++i)
+  {
+    for (int c = 0; c < 2; ++c)
+    {
+      float v = (c < ch && data[c]) ? data[c][i] : (ch > 0 ? data[0][i] : 0.f);
+      if (v > 1.f) v = 1.f; else if (v < -1.f) v = -1.f;
+      dryRing[c][w] = (int16_t) (v * 32767.f);
+    }
+    if (++w == kRingFrames) w = 0;
+  }
+  dryW.store(w, std::memory_order_relaxed);
+}
+
+inline void PopDry(AudioBufferList* io, int frames, float gain)
+{
+  if (!io) return;
+  int r = dryR.load(std::memory_order_relaxed);
+  int w = dryW.load(std::memory_order_relaxed);
+  int avail = (w - r + kRingFrames) % kRingFrames;
+  if (avail < frames)
+  {
+    r = (w - frames + kRingFrames) % kRingFrames; // under-run: realign, brief artefact is fine
+    dryR.store(r, std::memory_order_relaxed);
+  }
+  for (UInt32 b = 0; b < io->mNumberBuffers; ++b)
+  {
+    float* dst = (float*) io->mBuffers[b].mData;
+    const int16_t* src = dryRing[b < 2 ? b : 1];
+    for (int i = 0; i < frames; ++i)
+      dst[i] = (float) src[(r + i) % kRingFrames] * (gain / 32767.f);
+  }
+  dryR.store((r + frames) % kRingFrames, std::memory_order_relaxed);
+}
+} // namespace volum_diag
+// ===================== TEMP DIAGNOSTICS v2 - end ===========================
+
 @implementation IPlugAUPlayer
 {
   AVAudioEngine* audioEngine;
@@ -101,6 +291,15 @@ static void VoLumDiagLog(NSString* fmt, ...)
   BOOL inputTapInstalled;
   BOOL outputTapInstalled;
   AVAudioPlayer* tonePlayerDiag; // retain for the diagnostic tone's lifetime
+  // ---- TEMP DIAGNOSTICS v2 (remove wholesale) ----
+  BOOL auTapInstalled;      // tap on the AU's own output bus 0
+  BOOL dryPathConnected;    // faint DI source node attached once
+  AVAudioSourceNode* drySrcDiag;
+  volatile BOOL beepGate;   // render block reads this on the audio thread
+  int beepIndexDiag;        // beeps fired so far
+  uint64_t beepStartNs;     // t=0 for the TONE BEGIN/END stamps
+  dispatch_source_t beepTimerDiag;
+  dispatch_source_t tapFlushDiag;
 #endif
 }
 
@@ -219,6 +418,45 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
   // The mixer's own outputFormatForBus can come back zeroed before the engine
   // starts, so tap explicitly at the format just connected.
   [self installOutputLevelTap:outputHWFormat];
+
+  // TEMP DIAGNOSTICS v2: this method runs again on every relink. If each relink
+  // ADDS a mixer input bus instead of reusing one, the AU is fed into several
+  // dead buses and only one is audible - worth a line in the log.
+  VoLumDiagLog(@"Mixer input buses after connect: nextAvailable=%u (AU buses %ld)", (unsigned) [mainMixer nextAvailableInputBus],
+               (long) numOutputBuses);
+
+  // TEMP DIAGNOSTICS v2: tap the AU's own output bus as well, so "AU silent"
+  // can be separated from "mixer/outputNode silent".
+  [self installAULevelTap:outputHWFormat];
+
+  // TEMP DIAGNOSTICS v2: faint clean DI through a source node playing back the
+  // input-tap snapshot. Deliberately NOT a second live feed of inputNode: an
+  // extra inputNode consumer could change how the engine drives the input and
+  // sabotage the very path under test.
+  if (!dryPathConnected && outputHWFormat != nil && outputHWFormat.sampleRate > 0.0 && outputHWFormat.channelCount > 0)
+  {
+    @try
+    {
+      if (drySrcDiag == nil)
+      {
+        drySrcDiag = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL* isSilence, const AudioTimeStamp* timestamp,
+                                                                             AVAudioFrameCount frameCount, AudioBufferList* outputData) {
+          if (frameCount == 0) return noErr;
+          volum_diag::PopDry(outputData, (int) frameCount, 0.18f); // quiet on purpose: audible, never masking
+          return noErr;
+        }];
+        [audioEngine attachNode:drySrcDiag];
+      }
+      [audioEngine connect:drySrcDiag to:audioEngine.mainMixerNode format:outputHWFormat];
+      dryPathConnected = YES;
+      VoLumDiagLog(@"dry-di: DI source node attached at %g Hz x %u ch", outputHWFormat.sampleRate,
+                   (unsigned) outputHWFormat.channelCount);
+    }
+    @catch (NSException* e)
+    {
+      VoLumDiagLog(@"dry-di: FAILED %@ / %@ (cannot by itself silence the amp path)", e.name, e.reason);
+    }
+  }
 }
 
 // Counterpart of installInputLevelTap: peak level of whatever the engine is
@@ -235,6 +473,9 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
   @try
   {
     [mainMixer installTapOnBus:0 bufferSize:4096 format:fmt block:^(AVAudioPCMBuffer* buffer, AVAudioTime* whenTime) {
+    if (buffer.floatChannelData != nullptr)
+      volum_diag::Sample("tap_mix", (const float* const*) buffer.floatChannelData, (int) buffer.format.channelCount,
+                         (int) buffer.frameLength, buffer.format.sampleRate); // TEMP DIAGNOSTICS v2
     float peak = 0.f;
     if (buffer.floatChannelData != nullptr)
     {
@@ -359,6 +600,13 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
     return;
   const AVAudioFrameCount maxFrames = 4096;
   [audioEngine.inputNode installTapOnBus:0 bufferSize:maxFrames format:fmt block:^(AVAudioPCMBuffer* buffer, AVAudioTime* whenTime) {
+    if (buffer.floatChannelData != nullptr)
+    {
+      volum_diag::Sample("tap_in", (const float* const*) buffer.floatChannelData, (int) buffer.format.channelCount,
+                         (int) buffer.frameLength, buffer.format.sampleRate); // TEMP DIAGNOSTICS v2
+      volum_diag::FeedDry((const float* const*) buffer.floatChannelData, (int) buffer.format.channelCount,
+                          (int) buffer.frameLength); // TEMP DIAGNOSTICS v2 (faint DI playback)
+    }
     float peak = 0.f;
     if (buffer.floatChannelData != nullptr)
     {
@@ -391,6 +639,130 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
   NSLog(@"Input level tap installed (%g Hz x %u ch)", fmt.sampleRate, (unsigned) fmt.channelCount);
 }
 
+#if TARGET_OS_IOS
+// TEMP DIAGNOSTICS v2: the decisive question left open by the level taps is
+// WHICH PHYSICAL output the session is actually rendering to. HAL device
+// queries answer 0 devices from inside this sandbox, so ask AVAudioSession's
+// currentRoute instead (reading the proxies is ordinary API; the crash seen
+// earlier came from instantiating port objects, which this does not do).
+- (void) logSessionRoute: (NSString*) when
+{
+  @try
+  {
+    AVAudioSessionRouteDescription* route = [[AVAudioSession sharedInstance] currentRoute];
+    NSMutableString* outs = [NSMutableString string];
+    for (AVAudioSessionPortDescription* p in route.outputs)
+      [outs appendFormat:@"[%@/%@ ch=%lu]", p.portName, p.portType, (unsigned long) p.channels.count];
+    NSMutableString* ins = [NSMutableString string];
+    for (AVAudioSessionPortDescription* p in route.inputs)
+      [ins appendFormat:@"[%@/%@ ch=%lu]", p.portName, p.portType, (unsigned long) p.channels.count];
+    VoLumDiagLog(@"Session route %@: OUT=%@ IN=%@ vol=%.2f otherAudio=%d SR=%.0f", when, outs, ins,
+                 [[AVAudioSession sharedInstance] outputVolume], [[AVAudioSession sharedInstance] isOtherAudioPlaying],
+                 [[AVAudioSession sharedInstance] sampleRate]);
+  }
+  @catch (NSException* e)
+  {
+    VoLumDiagLog(@"Session route probe (%@) failed: %@ / %@", when, e.name, e.reason);
+  }
+}
+#endif
+
+// TEMP DIAGNOSTICS v2: tap the AU's own output bus 0. Answers "is the plug
+// printing audio?" separately from "is the mixer printing audio?".
+- (void) installAULevelTap: (AVAudioFormat*)fmt
+{
+  if (auTapInstalled)
+    return;
+  if (fmt == nil || fmt.sampleRate <= 0.0 || fmt.channelCount == 0)
+    return;
+  @try
+  {
+    [avAudioUnit installTapOnBus:0 bufferSize:4096 format:fmt block:^(AVAudioPCMBuffer* buffer, AVAudioTime* whenTime) {
+    if (buffer.floatChannelData != nullptr)
+      volum_diag::Sample("tap_au", (const float* const*) buffer.floatChannelData, (int) buffer.format.channelCount,
+                         (int) buffer.frameLength, buffer.format.sampleRate);
+    float peak = 0.f;
+    if (buffer.floatChannelData != nullptr)
+    {
+      for (AVAudioFrameCount c = 0; c < buffer.format.channelCount; ++c)
+      {
+        const float* data = buffer.floatChannelData[c];
+        for (AVAudioFrameCount i = 0; i < buffer.frameLength; ++i)
+        {
+          float v = fabsf(data[i]);
+          if (v > peak)
+            peak = v;
+        }
+      }
+    }
+    static uint64_t sLastAuLogNs = 0;
+    uint64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (nowNs - sLastAuLogNs >= 1000000000ull)
+    {
+      sLastAuLogNs = nowNs;
+      const float peakCopy = peak;
+      const double sr = fmt.sampleRate;
+      const unsigned nCh = (unsigned) fmt.channelCount;
+      dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        float db = peakCopy > 0.f ? 20.f * log10f(peakCopy) : -999.f;
+        VoLumDiagLog(@"AU tap peak: %.2f dBFS (fmt %g Hz x %u ch)", db, sr, nCh);
+      });
+    }
+  }];
+  }
+  @catch (NSException* e)
+  {
+    VoLumDiagLog(@"AU tap install failed: %@ / %@", e.name, e.reason);
+    return;
+  }
+  auTapInstalled = YES;
+  VoLumDiagLog(@"AU output bus tap installed (%g Hz x %u ch)", fmt.sampleRate, (unsigned) fmt.channelCount);
+}
+
+// TEMP DIAGNOSTICS v2: ring-buffer WAV capture needs a non-realtime flusher.
+- (void) startTapFlushTimer
+{
+  if (tapFlushDiag)
+    return;
+  NSArray* dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+  NSString* sub = [dirs.firstObject stringByAppendingPathComponent:@"VoLum"];
+  [[NSFileManager defaultManager] createDirectoryAtPath:sub withIntermediateDirectories:YES attributes:nil error:nil];
+  volum_diag::Init(sub.UTF8String);
+  VoLumDiagLog(@"tap WAV directory: %@", sub);
+
+  tapFlushDiag = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+  dispatch_source_set_timer(tapFlushDiag, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC * 200), NSEC_PER_MSEC * 200, NSEC_PER_MSEC * 50);
+  dispatch_source_set_event_handler(tapFlushDiag, ^{
+    volum_diag::Flush();
+    char line[256];
+    volum_diag::Status(line, sizeof(line), (long long) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / NSEC_PER_SEC));
+    if (line[0])
+      VoLumDiagLog(@"tap stat: %@", [NSString stringWithUTF8String: line]);
+  });
+  // dispatch sources start active; do NOT dispatch_resume.
+}
+
+// The AU lives in the AUv3 extension target, a separate link unit, so it only
+// EXPOSES the numbers and the app logs them here. Handoff hypothesis 5: does
+// the plug Prepare() at the negotiated rate or keep its prewarmed 48 kHz?
+- (void) logAURenderState
+{
+  SEL sel = NSSelectorFromString(@"diagRenderStateToArray:");
+  if (![avAudioUnit.AUAudioUnit respondsToSelector:sel])
+  {
+    VoLumDiagLog(@"AU render state: probe not available");
+    return;
+  }
+  NSMutableArray* st = [NSMutableArray array];
+  ((void (*)(id, SEL, id)) objc_msgSend)(avAudioUnit.AUAudioUnit, sel, st);
+  if (st.count != 3)
+    return;
+  VoLumDiagLog(@"AU render state: bus SR %g, output buses %d, plug SR after Prepare %d; AU bus in %g/%u out %g/%u",
+               [st[0] doubleValue], (int) [st[1] unsignedIntValue], (int) [st[2] longValue],
+               [avAudioUnit inputFormatForBus: 0].sampleRate, (unsigned) [avAudioUnit inputFormatForBus: 0].channelCount,
+               [avAudioUnit outputFormatForBus: 0].sampleRate, (unsigned) [avAudioUnit outputFormatForBus: 0].channelCount);
+}
+
 // Coalesced re-link: route changes can fire several times per hotplug, and the
 // new format is only visible once the session has settled.
 - (void) scheduleRelinkInput: (const char*) reason
@@ -419,6 +791,12 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
       [strongSelf->audioEngine.mainMixerNode removeTapOnBus:0];
       strongSelf->outputTapInstalled = NO;
     }
+    if (strongSelf->auTapInstalled) // TEMP DIAGNOSTICS v2
+    {
+      [strongSelf->avAudioUnit removeTapOnBus:0];
+      strongSelf->auTapInstalled = NO;
+    }
+    strongSelf->dryPathConnected = NO; // reset() dropped this edge; re-wired in -connectAudioUnitOutput
     BOOL wasRunning = [strongSelf->audioEngine isRunning];
     if (wasRunning)
       [strongSelf->audioEngine stop];
@@ -430,6 +808,9 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
     [strongSelf->audioEngine reset];
     strongSelf->inputConnected = NO; // reset() dropped every connection
     [strongSelf linkInputIfPossible];
+#if TARGET_OS_IOS
+    [strongSelf logSessionRoute: @"after relink"]; // TEMP DIAGNOSTICS v2
+#endif
     if (wasRunning)
     {
       NSError* err = nil;
@@ -592,15 +973,108 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
   
   if (![audioEngine startAndReturnError:&error])
     NSLog(@"engine failed to start: %@", error);
+
+#if PLUG_TYPE != 1
+  // TEMP DIAGNOSTICS v2: start the WAV flusher, then snapshot the route and
+  // the AU's negotiated render state.
+  [self startTapFlushTimer];
+#if TARGET_OS_IOS
+  [self logSessionRoute: @"at launch"];
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    [self logSessionRoute: @"t=6 s"];
+  });
+#endif
+  [self logAURenderState];
+#endif
   
 #if PLUG_TYPE != 1
-  // Diagnostic #2: a tone rendered INSIDE the engine (source node -> mixer ->
-  // outputNode) starting ~2.5 s after launch. Compare audibility against the
-  // AVAudioPlayer tone below: external tone audible + engine tone silent
-  // localizes the mute to the engine's remoteIO output leg.
+  // TEMP DIAGNOSTICS v2: PERIODIC 0.4 s 440 Hz beeps every 3 s from t=2.5 s
+  // (15 beeps, ~t=46 s). A one-shot tone only proves the output leg was alive
+  // once; the reported silence lasts >= 10 s, so the user counts WHICH beeps
+  // are audible: "all 15" = the output leg works throughout and the amp's own
+  // content is the problem; "0 of 15" = the engine's output leg never reaches
+  // the audible device; "some" = a route/relink event kills it mid-run.
   {
     AVAudioFormat* outFmt = [audioEngine.outputNode inputFormatForBus:0];
     if (outFmt != nil && outFmt.sampleRate > 0.0)
+    {
+      const double sr = outFmt.sampleRate;
+      const double skipFrames = 0.0;      // gate decides when it sounds
+      const double toneFrames = 1e18;    // gate decides how long
+      __block double framePos = 0;
+      __weak IPlugAUPlayer* weakPlayer = self;
+      AVAudioSourceNode* toneSrc2 = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL* isSilence, const AudioTimeStamp* timestamp, AVAudioFrameCount frameCount, AudioBufferList* outputData) {
+        IPlugAUPlayer* p = weakPlayer;
+        const BOOL on = (p != nil) ? p->beepGate : NO;
+        UInt32 nFrames = (UInt32) frameCount;
+        for (UInt32 ch = 0; ch < outputData->mNumberBuffers; ++ch)
+        {
+          float* buf = (float*) outputData->mBuffers[ch].mData;
+          for (UInt32 f = 0; f < nFrames; ++f)
+          {
+            float s = 0.f;
+            if (on)
+            {
+              const double pos = framePos + f;
+              s = (float) (0.35 * sin(2.0 * M_PI * 440.0 * pos / sr));
+            }
+            buf[f] = s;
+          }
+        }
+        framePos += nFrames;
+        return noErr;
+      }];
+      [audioEngine attachNode:toneSrc2];
+      @try
+      {
+        [audioEngine connect:toneSrc2 to:audioEngine.mainMixerNode format:outFmt];
+        VoLumDiagLog(@"beep: source node attached (0.4 s 440 Hz every 3 s, 15x from t=2.5 s)");
+      }
+      @catch (NSException* e)
+      {
+        VoLumDiagLog(@"beep: source connect failed: %@ / %@", e.name, e.reason);
+      }
+      beepStartNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      beepIndexDiag = 0;
+      beepGate = NO;
+      beepTimerDiag = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+      dispatch_source_set_timer(beepTimerDiag, dispatch_time(DISPATCH_TIME_NOW, (int64_t) (2.5 * NSEC_PER_SEC)), NSEC_PER_SEC * 3,
+                                NSEC_PER_MSEC * 20);
+      dispatch_source_set_event_handler(beepTimerDiag, ^{
+        IPlugAUPlayer* p = weakPlayer;
+        if (p == nil)
+          return;
+        if (p->beepIndexDiag >= 15)
+        {
+          dispatch_source_cancel(p->beepTimerDiag);
+          p->beepTimerDiag = NULL;
+          VoLumDiagLog(@"beep: finished after 15 beeps");
+          return;
+        }
+        p->beepIndexDiag++;
+        p->beepGate = YES;
+        double t = (double) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - p->beepStartNs) / 1e9;
+        VoLumDiagLog(@"TONE BEGIN %d/15 t=%.1f s", p->beepIndexDiag, t);
+#if TARGET_OS_IOS
+        [p logSessionRoute: @"before beep"];
+#endif
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+          IPlugAUPlayer* q = weakPlayer;
+          if (q == nil)
+            return;
+          q->beepGate = NO;
+          double t2 = (double) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - q->beepStartNs) / 1e9;
+          VoLumDiagLog(@"TONE END %d/15 t=%.1f s gate was %d", q->beepIndexDiag, t2, (int) q->beepGate);
+        });
+      });
+      // dispatch sources are created active: no dispatch_resume here.
+    }
+  }
+
+  // Old one-shot engine tone (kept disabled in form, removed with v2 cleanup).
+  {
+    AVAudioFormat* outFmt = [audioEngine.outputNode inputFormatForBus:0];
+    if (NO)
     {
       const double sr = outFmt.sampleRate;
       const double skipFrames = 2.5 * sr;      // let the session settle first
