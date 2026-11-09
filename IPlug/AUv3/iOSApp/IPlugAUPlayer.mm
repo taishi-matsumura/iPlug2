@@ -161,7 +161,7 @@ inline Sink* SinkFor(const char* tag, int ch, double sr)
   if (dirPath[0])
   {
     char path[640];
-    snprintf(path, sizeof(path), "%s/tap_%s.wav", dirPath, tag);
+    snprintf(path, sizeof(path), "%s/%s.wav", dirPath, tag);
     freeSlot->f = fopen(path, "wb");
     if (freeSlot->f)
       WavHeader(freeSlot->f, freeSlot->sr, freeSlot->ch);
@@ -223,20 +223,14 @@ inline void Flush()
   }
 }
 
-inline void Status(char* out, int cap, long long nowSec)
+inline void Status(int idx, char* out, int cap)
 {
-  static long long lastSec = -1;
-  if (nowSec == lastSec) return;
-  lastSec = nowSec;
-  for (int i = 0; i < kMaxSinks; ++i)
-  {
-    Sink* s = &sinks[i];
-    if (!s->tag[0]) continue;
-    snprintf(out, cap, "tap '%s' frames %lld dropped %lld flushes %lld file %s sr %d ch %d", s->tag, s->frames, s->dropped,
-             s->flushes, s->f ? "open" : "MISSING", s->sr, s->ch);
-    return; // one sink per tick keeps the log readable
-  }
   out[0] = 0;
+  if (idx < 0 || idx >= kMaxSinks) return;
+  Sink* s = &sinks[idx];
+  if (!s->tag[0]) return;
+  snprintf(out, cap, "'%s' frames %lld dropped %lld flushes %lld file %s sr %d ch %d", s->tag, s->frames, s->dropped,
+           s->flushes, s->f ? "open" : "MISSING", s->sr, s->ch);
 }
 
 // Faint dry DI passthrough: input tap snapshot -> source node playback.
@@ -732,14 +726,44 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
 
   tapFlushDiag = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
   dispatch_source_set_timer(tapFlushDiag, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC * 200), NSEC_PER_MSEC * 200, NSEC_PER_MSEC * 50);
+  __block long long lastSecDiag = -1;
+  static unsigned long long prevCalls = 0, prevRejected = 0, prevSumNs = 0; // AU cost deltas
   dispatch_source_set_event_handler(tapFlushDiag, ^{
     volum_diag::Flush();
-    char line[256];
-    volum_diag::Status(line, sizeof(line), (long long) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / NSEC_PER_SEC));
-    if (line[0])
-      VoLumDiagLog(@"tap stat: %@", [NSString stringWithUTF8String: line]);
+    for (int i = 0; i < volum_diag::kMaxSinks; ++i)
+    {
+      char line[192];
+      volum_diag::Status(i, line, sizeof(line));
+      if (line[0])
+        VoLumDiagLog(@"tap stat: %@", [NSString stringWithUTF8String: line]);
+    }
+    const long long sec = (long long) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / NSEC_PER_SEC);
+    if (sec != lastSecDiag)
+    {
+      lastSecDiag = sec;
+      SEL sel = NSSelectorFromString(@"diagRenderCostToArray:");
+      if ([avAudioUnit.AUAudioUnit respondsToSelector:sel])
+      {
+        NSMutableArray* c = [NSMutableArray array];
+        ((void (*)(id, SEL, id)) objc_msgSend)(avAudioUnit.AUAudioUnit, sel, c);
+        if (c.count == 7)
+        {
+          const unsigned long long calls = [c[0] unsignedLongLongValue], rejected = [c[1] unsignedLongLongValue],
+                                     sumNs = [c[2] unsignedLongLongValue];
+          const double dCalls = (double) (calls - prevCalls), dRejected = (double) (rejected - prevRejected),
+                         dNs = (double) (sumNs - prevSumNs);
+          prevCalls = calls; prevRejected = rejected; prevSumNs = sumNs;
+          VoLumDiagLog(@"AU render: %.0f calls/s, avg %.1f us, max %.1f us, REJECTED %lld (+%.0f this s), frames min %d max %d, plug block %d",
+                       dCalls, dCalls > 0 ? dNs / dCalls / 1000.0 : 0.0, [c[3] unsignedLongLongValue] / 1000.0,
+                       (long long) rejected, dRejected, (int) [c[5] unsignedIntValue], (int) [c[4] unsignedIntValue],
+                       (int) [c[6] longLongValue]);
+        }
+      }
+    }
   });
-  // dispatch sources start active; do NOT dispatch_resume.
+  // A fresh dispatch source is INACTIVE until resumed; without this the flusher
+  // never ran (0-byte WAVs, no tap stat lines) and the beep timer never fired.
+  dispatch_resume(tapFlushDiag);
 }
 
 // The AU lives in the AUv3 extension target, a separate link unit, so it only
@@ -1067,7 +1091,7 @@ static void VoLumLogHALDeviceEndpoint(UInt32 propSelector, const char* tag)
           VoLumDiagLog(@"TONE END %d/15 t=%.1f s gate was %d", q->beepIndexDiag, t2, (int) q->beepGate);
         });
       });
-      // dispatch sources are created active: no dispatch_resume here.
+      dispatch_resume(beepTimerDiag); // created INACTIVE: without this no TONE line ever appeared
     }
   }
 

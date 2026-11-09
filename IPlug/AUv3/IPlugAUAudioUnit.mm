@@ -531,6 +531,43 @@ static AUAudioUnitPreset* NewAUPreset(NSInteger number, NSString* pName)
   return YES;
 }
 
+// TEMP DIAGNOSTICS v2 (VoLum iOS silence hunt): this wrapper REJECTS any
+// render request larger than the plug's configured block size
+// (frameCount > GetBlockSize() -> kAudioUnitErr_InvalidPropertyValue, no
+// output). If iOS widens the hardware IO buffer under CPU/thermal pressure or
+// after a route change, every later render call is rejected and the graph
+// carries silence while the taps still measure a live path. Counting
+// rejections and the real render cost is the decisive probe; the app-side
+// player reads the totals because the extension cannot call its logger.
+#if TARGET_OS_IOS
+namespace volum_au_diag
+{
+struct Cost
+{
+  unsigned long long calls = 0;
+  unsigned long long rejected = 0;
+  unsigned long long sumNs = 0;
+  unsigned long long maxNs = 0;
+  unsigned maxFrames = 0;
+  unsigned minFrames = 0xFFFFFFFFu;
+};
+static Cost cost;
+
+struct Guard
+{
+  uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  ~Guard()
+  {
+    const uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    cost.calls++;
+    cost.sumNs += d;
+    if (d > cost.maxNs)
+      cost.maxNs = d;
+  }
+};
+} // namespace volum_au_diag
+#endif
+
 // TEMP DIAGNOSTICS (VoLum, iOS silence hunt): read-only snapshot of what this
 // AU negotiated, exposed for the app-side player to log. The AUv3 extension is
 // a separate link unit and cannot call the app's file logger. Remove together
@@ -550,6 +587,24 @@ static AUAudioUnitPreset* NewAUPreset(NSInteger number, NSString* pName)
   [out addObject: @(busSR)];
   [out addObject: @(nOutBuses)];
   [out addObject: @(plugSR)];
+}
+
+// TEMP DIAGNOSTICS v2: render-cost / rejected-render census for the app-side
+// player to log once per second (the extension cannot call the app's logger).
+- (void) diagRenderCostToArray: (NSMutableArray*) out
+{
+  if (out == nil) return;
+#if TARGET_OS_IOS
+  [out addObject: @(volum_au_diag::cost.calls)];
+  [out addObject: @(volum_au_diag::cost.rejected)];
+  [out addObject: @(volum_au_diag::cost.sumNs)];
+  [out addObject: @(volum_au_diag::cost.maxNs)];
+  [out addObject: @(volum_au_diag::cost.maxFrames)];
+  [out addObject: @(volum_au_diag::cost.minFrames == 0xFFFFFFFFu ? 0u : volum_au_diag::cost.minFrames)];
+  [out addObject: @((long long) (mPlug != nullptr ? mPlug->GetBlockSize() : -1))];
+#else
+  [out addObject: @0];
+#endif
 }
 
 - (void) deallocateRenderResources
@@ -590,8 +645,16 @@ static AUAudioUnitPreset* NewAUPreset(NSInteger number, NSString* pName)
     AudioUnitRenderActionFlags pullFlags = 0;
     AUAudioUnitStatus err = 0;
     
+    #if TARGET_OS_IOS
+    volum_au_diag::Guard costGuardDiag; // TEMP DIAGNOSTICS v2
+    if (frameCount > volum_au_diag::cost.maxFrames) volum_au_diag::cost.maxFrames = (unsigned) frameCount;
+    if (frameCount < volum_au_diag::cost.minFrames) volum_au_diag::cost.minFrames = (unsigned) frameCount;
+    #endif
     if (frameCount > pPlug->GetBlockSize())
     {
+      #if TARGET_OS_IOS
+      volum_au_diag::cost.rejected++; // TEMP DIAGNOSTICS v2
+      #endif
       err = kAudioUnitErr_InvalidPropertyValue;
       return err;
     }
